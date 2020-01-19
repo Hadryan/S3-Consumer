@@ -1,0 +1,215 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: S3 Queue Notifications Test
+Parameters:
+  AppName:
+    Description: Please use lower case only.
+    Type: String
+    Default: ta-s3-consumer
+  Environment:
+    Type: String
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Default: dev
+  SourceBucketSuffix:
+    Description: The unique suffix of the S3 source bucket which files will be copied from.
+    Type: String
+  TargetBucketSuffix:
+    Description: The unique suffix of the S3 destination bucket which files will be copied to.
+    Type: String
+  ParentStackName:
+    Description: Name of the parent stack which contains the Lambda function.
+    Type: String
+  LambdaFileName:
+    Description: The filename of the zipped lambda file.
+    Type: String
+    Default: lambda_function.zip
+  LambdaHandler:
+    Description: The Lambda Python Handler.
+    Type: String
+    Default: lambda_function.lambda_handler
+Resources:
+  TargetBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Join 
+        - '-'
+        - - !Ref AppName
+          - !Ref Environment
+          - target
+          - !Ref TargetBucketSuffix
+  PriorityQueue:
+    Type: 'AWS::SQS::Queue'
+    DependsOn:
+      - TargetBucket
+    Properties:
+      DelaySeconds: 0
+      MaximumMessageSize: 262144
+      MessageRetentionPeriod: 86400
+      QueueName: !Join 
+        - '-'
+        - - !Ref AppName
+          - !Ref Environment
+          - priority
+      ReceiveMessageWaitTimeSeconds: 0
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt FailureQueue.Arn
+        maxReceiveCount: 10
+      VisibilityTimeout: 90
+  FailureQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      DelaySeconds: 0
+      MaximumMessageSize: 262144
+      MessageRetentionPeriod: 864000
+      QueueName: !Join 
+        - '-'
+        - - !Ref AppName
+          - !Ref Environment
+          - failure
+      ReceiveMessageWaitTimeSeconds: 0
+      VisibilityTimeout: 500
+  QueuePolicy:
+    Type: 'AWS::SQS::QueuePolicy'
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - 'SQS:SendMessage'
+            Resource: !GetAtt PriorityQueue.Arn
+            Condition:
+              StringLike:
+                'aws:SourceArn': !Join 
+                  - ''
+                  - - 'arn:aws:s3:::'
+                    - !Join 
+                      - '-'
+                      - - !Ref AppName
+                        - !Ref Environment
+                        - source
+                        - !Ref SourceBucketSuffix
+      Queues:
+        - !Ref PriorityQueue
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties: 
+      DisplayName: !Ref AppName
+      Tags: 
+        - Key: Stack Name
+          Value: !Ref 'AWS::StackName'
+      TopicName: !Join 
+            - '-'
+            - - !Ref AppName
+              - !Ref Environment
+              - source
+              - !Ref SourceBucketSuffix
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: allowLambdaLogs
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:*'
+                Resource: 'arn:aws:logs:*:*:*'
+        - PolicyName: allowSqs
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sqs:ReceiveMessage'
+                  - 'sqs:DeleteMessage'
+                  - 'sqs:GetQueueAttributes'
+                  - 'sqs:ChangeMessageVisibility'
+                Resource: !GetAtt PriorityQueue.Arn
+        - PolicyName: allowSNS
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref SNSTopic
+#                Resource: !Join [ '', [ 'arn:aws:sns:', !Ref 'AWS::Region' ,':' , !Ref 'AWS::AccountId', !Getatt 'SNSTopic.topicname' ]]
+        - PolicyName: AllowLambdaS3ReadWriteTS
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'S3:*'
+                Resource: !Join [ '', [ 'arn:aws:s3:::', !Ref AppName, '-', !Ref Environment, '*' ]]
+  LambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: 
+            Fn::ImportValue:
+                !Sub 
+                    ${ParentStackName}-Bucket
+        S3Key: !Ref LambdaFileName
+      Handler: !Ref LambdaHandler
+      Environment: 
+        Variables:
+            Destination_S3_Bucket: !Join 
+              - '-'
+              - - !Ref AppName
+                - !Ref Environment
+                - target
+                - !Ref TargetBucketSuffix
+            SNSTopic: !Join 
+              - '' 
+              - - 'arn:aws:sns:'
+                - !Ref AWS::Region
+                - ':'
+                - !Ref AWS::AccountId
+                - ':'
+                - !GetAtt SNSTopic.TopicName
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.8
+      Timeout: 60
+      MemorySize: 512
+  LambdaFunctionEventSourceMapping:
+    Type: 'AWS::Lambda::EventSourceMapping'
+    Properties:
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn: !GetAtt PriorityQueue.Arn
+      FunctionName: !GetAtt LambdaFunction.Arn
+  SourceBucket:
+    Type: 'AWS::S3::Bucket'
+    DependsOn:
+      - QueuePolicy
+      - PriorityQueue
+      - LambdaFunction
+    Properties:
+      BucketName: !Join 
+        - '-'
+        - - !Ref AppName
+          - !Ref Environment
+          - source
+          - !Ref SourceBucketSuffix
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Queue: !GetAtt PriorityQueue.Arn
+      Tags:
+        - Key: Stack Name
+          Value: !Ref 'AWS::StackName'
